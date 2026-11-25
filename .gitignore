@@ -1,0 +1,21 @@
+# Perfil de navegador con sesiones SSO locales (NO subir al repo)
+browser_profile/
+
+# Logs, capturas y archivos temporales de ejecución
+__pycache__/
+*.py[cod]
+*.log
+screenshots/
+*.eml
+
+# Archivos generados por ejecuciones / pruebas locales
+ficheros/carga_temporal.xlsx
+ficheros/test_*.xlsx
+resultados_emision_*.xlsx
+solicitud_prueba_*.xlsx
+
+# Entornos virtuales y variables de entorno
+.venv/
+venv/
+.env
+*.env
