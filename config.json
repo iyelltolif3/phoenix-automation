@@ -7,7 +7,8 @@
   "browser_profile_dir": "browser_profile",
   "firefox_path": "",
   "download_dir": "~/Downloads/vouchers",
-  "wait_timeout": 20,
+  "wait_timeout": 35,
+  "slow_mo_ms": 0,
   "email": {
     "modo": "eml",
     "smtp_host": "smtp.office365.com",

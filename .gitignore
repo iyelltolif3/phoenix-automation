@@ -11,6 +11,7 @@ screenshots/
 # Archivos generados por ejecuciones / pruebas locales
 ficheros/carga_temporal.xlsx
 ficheros/test_*.xlsx
+ficheros/mvp_adjuntos/
 resultados_emision_*.xlsx
 solicitud_prueba_*.xlsx
 

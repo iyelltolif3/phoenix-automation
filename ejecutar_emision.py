@@ -17,6 +17,7 @@ import openpyxl
 
 from phoenix_emision import PhoenixAutomation, DatosEmision, Pasajero
 from emision_grupal import PhoenixEmisionGrupal, _cargar_workbook_seguro, validar_excel_grupal
+from mvp_autoemision import ejecutar_mvp_interactivo
 from utils import (
     buscar_dealer_por_correo,
     buscar_dealer_por_nombre,
@@ -295,72 +296,89 @@ def mostrar_resultado(resultado: dict):
 
 
 def main():
-    limpiar_pantalla()
-    mostrar_banner()
+    while True:
+        limpiar_pantalla()
+        mostrar_banner()
 
-    print("Opciones:")
-    print("  1. Emisión individual")
-    print("  2. Emisión grupal (con fichero)")
-    print("  3. Emisión por lote desde Excel (emitir_lote.py)")
-    print("  4. Solo buscar dealer")
-    print("  5. Test de utilidades")
-    print("  0. Salir")
+        print("─── SECCIÓN MVP (AUTOEMISIÓN EN PANTALLA) ──────────────")
+        print("  1. [MVP] Autoemisión visual desde correo (.eml / texto + Excel)")
+        print("")
+        print("─── EMISIÓN ESTÁNDAR / LOTE ────────────────────────────")
+        print("  2. Emisión individual (asistida)")
+        print("  3. Emisión grupal (con fichero Excel)")
+        print("  4. Emisión por lote desde Excel (emitir_lote.py)")
+        print("  5. Solo buscar dealer")
+        print("  6. Test de utilidades")
+        print("  0. Salir")
 
-    opcion = input("\nSelecciona: ").strip()
+        opcion = input("\nSelecciona: ").strip()
 
-    if opcion == "0":
-        return
-    if opcion == "4":
-        buscar_dealer_interactivo()
-        return
-    if opcion == "5":
-        subprocess.run([sys.executable, "utils.py"], cwd=os.path.dirname(__file__))
-        return
-    if opcion == "3":
-        ruta = input("Ruta al Excel de solicitudes [plantilla_solicitudes.xlsx]: ").strip().strip('"') or "plantilla_solicitudes.xlsx"
-        subprocess.run([sys.executable, "emitir_lote.py", ruta], cwd=os.path.dirname(__file__))
-        return
-
-    if opcion in ("1", "2"):
-        grupal = opcion == "2"
-        datos, dry_run, formato_fichero, indice_titular = recopilar_datos_emision(grupal=grupal)
-        if not datos:
+        if opcion == "0":
             return
+        if opcion == "1":
+            ejecutar_mvp_interactivo()
+            input("\nPresiona ENTER para volver al menú...")
+            continue
+        if opcion == "5":
+            buscar_dealer_interactivo()
+            input("\nPresiona ENTER para volver al menú...")
+            continue
+        if opcion == "6":
+            subprocess.run([sys.executable, "utils.py"], cwd=os.path.dirname(__file__))
+            input("\nPresiona ENTER para volver al menú...")
+            continue
+        if opcion == "4":
+            ruta = input("Ruta al Excel de solicitudes [plantilla_solicitudes.xlsx]: ").strip().strip('"') or "plantilla_solicitudes.xlsx"
+            subprocess.run([sys.executable, "emitir_lote.py", ruta], cwd=os.path.dirname(__file__))
+            input("\nPresiona ENTER para volver al menú...")
+            continue
 
-        if input("\n¿Iniciar navegador y ejecutar? (s/n) [s]: ").strip().lower() == "n":
-            print("❌ Cancelado")
-            return
+        if opcion in ("2", "3"):
+            grupal = opcion == "3"
+            datos, dry_run, formato_fichero, indice_titular = recopilar_datos_emision(grupal=grupal)
+            if not datos:
+                input("\nPresiona ENTER para volver al menú...")
+                continue
 
-        browser = input("Navegador a usar (edge/chrome/chromium/firefox) [edge]: ").strip().lower() or "edge"
-        email_modo = input("Envío de correo al asegurado (eml/smtp/outlook_send/outlook_draft/no) [eml]: ").strip().lower() or "eml"
-        enviar_email = email_modo != "no"
-        phoenix = PhoenixEmisionGrupal(browser=browser) if grupal else PhoenixAutomation(browser=browser)
+            if input("\n¿Iniciar navegador y ejecutar? (s/n) [s]: ").strip().lower() == "n":
+                print("❌ Cancelado")
+                continue
 
-        if not phoenix.conectar_navegador():
-            return
+            browser = input("Navegador a usar (edge/chrome/chromium/firefox) [edge]: ").strip().lower() or "edge"
+            email_modo = input("Envío de correo al asegurado (eml/smtp/outlook_send/outlook_draft/no) [eml]: ").strip().lower() or "eml"
+            enviar_email = email_modo != "no"
+            phoenix = (
+                PhoenixEmisionGrupal(browser=browser, headless=False, slow_mo=150, visual_hud=True)
+                if grupal
+                else PhoenixAutomation(browser=browser, headless=False, slow_mo=150, visual_hud=True)
+            )
 
-        try:
-            phoenix.navegar_a_phoenix()
-            if grupal:
-                resultado = phoenix.emitir_voucher_grupal(
-                    datos,
-                    formato_fichero=formato_fichero,
-                    indice_titular=indice_titular,
-                    dry_run=dry_run,
-                    enviar_correo_asegurado=enviar_email,
-                    email_modo=email_modo if enviar_email else None,
-                )
-            else:
-                resultado = phoenix.emitir_voucher(
-                    datos,
-                    dry_run=dry_run,
-                    enviar_correo_asegurado=enviar_email,
-                    email_modo=email_modo if enviar_email else None,
-                )
-            mostrar_resultado(resultado)
-        finally:
-            input("\nPresiona ENTER para cerrar el navegador de automatización...")
-            phoenix.cerrar()
+            if not phoenix.conectar_navegador():
+                input("\nPresiona ENTER para volver al menú...")
+                continue
+
+            try:
+                phoenix.navegar_a_phoenix()
+                if grupal:
+                    resultado = phoenix.emitir_voucher_grupal(
+                        datos,
+                        formato_fichero=formato_fichero,
+                        indice_titular=indice_titular,
+                        dry_run=dry_run,
+                        enviar_correo_asegurado=enviar_email,
+                        email_modo=email_modo if enviar_email else None,
+                    )
+                else:
+                    resultado = phoenix.emitir_voucher(
+                        datos,
+                        dry_run=dry_run,
+                        enviar_correo_asegurado=enviar_email,
+                        email_modo=email_modo if enviar_email else None,
+                    )
+                mostrar_resultado(resultado)
+            finally:
+                input("\nPresiona ENTER para cerrar el navegador de automatización...")
+                phoenix.cerrar()
 
 
 if __name__ == "__main__":

@@ -22,10 +22,15 @@ playwright install chromium
 
 ## Guía Rápida de Uso
 
-### Opción A: Modo Interactivo (uno a uno)
+### Opción A: Menú Interactivo (incluye sección `[MVP] Autoemisión visual desde correo`)
 ```powershell
 python ejecutar_emision.py
 ```
+
+El apartado **`[MVP] Autoemisión visual desde correo`** (`mvp_autoemision.py`) permite:
+- Cargar un archivo `.eml` real (con adjuntos `.xlsx` o tablas HTML) o pegar el texto del correo.
+- Auditar rigurosamente todos los datos y RUTs (módulo 11, edades/fechas sospechosas, teléfonos) antes de tocar Phoenix.
+- Ejecutar la emisión en pantalla con navegador visible, indicador flotante paso a paso (HUD) y confirmación opcional antes de `Aceptar` (o en modo `--dry-run`).
 
 ### Opción B: Emisión por Lote desde Excel (recomendado)
 ```powershell

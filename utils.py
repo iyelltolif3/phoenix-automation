@@ -170,9 +170,36 @@ def generar_resumen_emision(tipo_viaje: str, clp: str = "", usd: str = "", tc: s
 
 
 def validar_rut(rut: str) -> bool:
-    """Valida un RUT chileno (sin dígito verificador)."""
+    """Valida longitud básica de un RUT chileno (sin dígito verificador)."""
     rut_limpio = re.sub(r'[^0-9]', '', rut)
     return len(rut_limpio) >= 7 and len(rut_limpio) <= 9
+
+
+def calcular_dv_rut(numero: str) -> str:
+    """Calcula el dígito verificador módulo 11 de un RUT chileno (retorna '0'-'9' o 'K')."""
+    digitos = re.sub(r"[^0-9]", "", str(numero or ""))
+    if not digitos:
+        return ""
+    suma = 0
+    factor = 2
+    for ch in reversed(digitos):
+        suma += int(ch) * factor
+        factor = 2 if factor == 7 else factor + 1
+    resto = 11 - (suma % 11)
+    if resto == 11:
+        return "0"
+    if resto == 10:
+        return "K"
+    return str(resto)
+
+
+def validar_rut_modulo11(numero: str, dv: str) -> bool:
+    """Verifica que el número (7-9 dígitos) y el DV coincidan según módulo 11."""
+    num_limpio = re.sub(r"[^0-9]", "", str(numero or ""))
+    dv_limpio = str(dv or "").strip().upper()
+    if len(num_limpio) < 7 or len(num_limpio) > 9 or not re.fullmatch(r"[0-9K]", dv_limpio):
+        return False
+    return calcular_dv_rut(num_limpio) == dv_limpio
 
 
 def limpiar_rut(rut: str) -> tuple[str, str]:
@@ -181,12 +208,12 @@ def limpiar_rut(rut: str) -> tuple[str, str]:
     Entrada: '12345678-9' o '12.345.678-9'
     Retorna: ('12345678', '9')
     """
-    rut_limpio = rut.strip().replace(".", "")
+    rut_limpio = rut.strip().replace(".", "").replace(" ", "")
     if "-" in rut_limpio:
-        partes = rut_limpio.split("-")
-        return partes[0], partes[1]
+        partes = rut_limpio.split("-", 1)
+        return partes[0], partes[1].upper()
     # Si no tiene guión, el último carácter es el DV
-    return rut_limpio[:-1], rut_limpio[-1]
+    return rut_limpio[:-1], rut_limpio[-1].upper()
 
 
 if __name__ == "__main__":

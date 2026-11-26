@@ -127,30 +127,122 @@ class PhoenixAutomation:
 
     IFRAME_SELECTOR = "#iframeContenidoMaestro"
 
-    def __init__(self, browser: str | None = None, headless: bool | None = None):
+    def __init__(
+        self,
+        browser: str | None = None,
+        headless: bool | None = None,
+        slow_mo: int | None = None,
+        visual_hud: bool = False,
+    ):
         self.config = cargar_config()
         self.browser_name = (browser or self.config.get("browser", "edge")).lower()
         self.headless = bool(self.config.get("headless", False) if headless is None else headless)
-        self.timeout_ms = int(self.config.get("wait_timeout", 20)) * 1000
+        self.timeout_ms = max(int(self.config.get("wait_timeout", 35)), 30) * 1000
+        self.slow_mo = int(self.config.get("slow_mo_ms", 0) if slow_mo is None else slow_mo)
+        self.visual_hud = visual_hud
 
         self.playwright: Playwright | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self.ultima_alerta: str | None = None
+        self.alertas: list[str] = []
 
     @property
     def frame(self) -> FrameLocator:
         """Retorna el FrameLocator del iframe principal de Phoenix."""
         return self.page.frame_locator(self.IFRAME_SELECTOR)
 
+    def _limpiar_alertas(self):
+        self.ultima_alerta = None
+        self.alertas.clear()
+
     def _on_dialog(self, dialog: Dialog):
         """Acepta automáticamente alertas/confirmaciones JS y registra el mensaje."""
-        self.ultima_alerta = dialog.message
-        logger.info(f"🔔 Alerta JS ({dialog.type}): {dialog.message}")
+        msg = (dialog.message or "").strip()
+        self.ultima_alerta = msg
+        self.alertas.append(msg)
+        logger.info(f"🔔 Alerta JS ({dialog.type}): {msg}")
         try:
             dialog.accept()
         except Exception:
             pass
+
+    def mostrar_hud(self, titulo: str, detalle: str = ""):
+        """Muestra un indicador flotante en pantalla durante la autoemisión visual."""
+        if not self.visual_hud or not self.page:
+            return
+        try:
+            self.page.evaluate(
+                """([titulo, detalle]) => {
+                    let box = document.getElementById('phoenix-mvp-hud');
+                    if (!box) {
+                        box = document.createElement('div');
+                        box.id = 'phoenix-mvp-hud';
+                        Object.assign(box.style, {
+                            position: 'fixed',
+                            bottom: '14px',
+                            right: '14px',
+                            zIndex: '2147483647',
+                            background: 'rgba(15, 23, 42, 0.92)',
+                            color: '#f8fafc',
+                            padding: '10px 14px',
+                            borderRadius: '10px',
+                            borderLeft: '4px solid #ef4444',
+                            fontFamily: 'Segoe UI, sans-serif',
+                            fontSize: '12px',
+                            maxWidth: '360px',
+                            boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+                            pointerEvents: 'none',
+                        });
+                        document.body.appendChild(box);
+                    }
+                    box.innerHTML = `<div style="font-weight:700;color:#fca5a5;margin-bottom:2px;">🤖 ${titulo}</div>` +
+                        (detalle ? `<div style="color:#e2e8f0;">${detalle}</div>` : '');
+                }""",
+                [titulo, detalle],
+            )
+        except Exception:
+            pass
+
+    def _esperar_sin_loading(self, timeout_ms: int | None = None):
+        """Espera a que desaparezcan los paneles de carga DevExpress dentro del iframe."""
+        if not self.page:
+            return
+        t_ms = timeout_ms or self.timeout_ms
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=min(t_ms, 10000))
+        except Exception:
+            pass
+        loading_sel = "[id$='_LP']:visible, .dxlpLoadingPanel:visible, .dxpcLoadingPanel:visible"
+        try:
+            lp = self.frame.locator(loading_sel)
+            if lp.count() > 0:
+                lp.first.wait_for(state="hidden", timeout=t_ms)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(250)
+
+    def _detectar_errores_visibles_modal(self) -> list[str]:
+        """Inspecciona mensajes de error o validación visibles dentro de #Wcr_PW-1."""
+        errores: list[str] = []
+        try:
+            err_locs = self.frame.locator(
+                "#Wcr_PW-1 .dxeOutOfRWarn, "
+                "#Wcr_PW-1 .dxvsValidationSummary li, "
+                "#Wcr_PW-1 [id*='lblError'], "
+                "#Wcr_PW-1 [id*='MensajeError'], "
+                "#Wcr_PW-1 span[style*='Red'], "
+                "#Wcr_PW-1 span[style*='red']"
+            )
+            for i in range(min(err_locs.count(), 10)):
+                el = err_locs.nth(i)
+                if el.is_visible():
+                    txt = el.inner_text().strip()
+                    if txt and txt not in errores:
+                        errores.append(txt)
+        except Exception:
+            pass
+        return errores
 
     def conectar_navegador(self, browser: str | None = None) -> bool:
         """
@@ -175,6 +267,7 @@ class PhoenixAutomation:
                 "accept_downloads": True,
                 "downloads_path": download_dir,
                 "viewport": None,
+                "slow_mo": self.slow_mo,
             }
 
             if target == "edge":
@@ -226,20 +319,30 @@ class PhoenixAutomation:
         (o Certificates -> List of Certificates) y espera #btnNew dentro del iframe.
         """
         logger.info("Navegando a Emisión y Consulta de Vouchers / List of Certificates...")
+        self.mostrar_hud("Navegando a Emisión", "Abriendo Emisión y Consulta de Vouchers...")
 
-        submenu_href = self.page.locator("a[href*='listaContratos.aspx']")
-        if submenu_href.count() > 0:
-            submenu_href.first.evaluate("el => el.click()")
-        else:
-            menu = self.page.locator("a:has-text('Pólizas/Vouchers'), a:has-text('Certificates')").first
-            menu.click()
-            submenu = self.page.locator(
-                "a:has-text('Emisión y Consulta'), a:has-text('List of Certificates'), a[href*='listaContratos.aspx']"
-            ).first
-            submenu.click()
-
-        self.frame.locator("#btnNew").wait_for(state="visible", timeout=self.timeout_ms)
-        logger.info("✅ En listaContratos.aspx (#btnNew visible)")
+        for intento in range(2):
+            submenu_href = self.page.locator("a[href*='listaContratos.aspx']")
+            if submenu_href.count() > 0:
+                submenu_href.first.evaluate("el => el.click()")
+            else:
+                menu = self.page.locator("a:has-text('Pólizas/Vouchers'), a:has-text('Certificates')").first
+                menu.click()
+                submenu = self.page.locator(
+                    "a:has-text('Emisión y Consulta'), a:has-text('List of Certificates'), a[href*='listaContratos.aspx']"
+                ).first
+                submenu.click()
+            try:
+                self.frame.locator("#btnNew").wait_for(state="visible", timeout=self.timeout_ms)
+                self._esperar_sin_loading()
+                logger.info("✅ En listaContratos.aspx (#btnNew visible)")
+                return
+            except PlaywrightTimeoutError:
+                if intento == 0:
+                    logger.warning("⚠️ Timeout esperando #btnNew; reintentando navegación...")
+                    self.page.wait_for_timeout(1500)
+                else:
+                    raise
 
     def seleccionar_sociedad_grilla(self, texto_sociedad: str = "CHILE"):
         """Filtra la grilla de listaContratos.aspx por sociedad (#cmbSociedad_I)."""
@@ -262,23 +365,37 @@ class PhoenixAutomation:
     def nuevo_contrato(self):
         """Hace clic en #btnNew y espera que se abra el modal #Wcr_PW-1."""
         logger.info("Abriendo modal de Nuevo contrato (#btnNew)...")
-        self.frame.locator("#btnNew").click()
-        self.frame.locator("#Wcr_PW-1").wait_for(state="visible", timeout=self.timeout_ms)
-        self.frame.locator("#Wcr_txtcodCliente").wait_for(state="visible", timeout=self.timeout_ms)
-        logger.info("✅ Modal #Wcr_PW-1 abierto")
+        self.mostrar_hud("Nuevo Contrato", "Abriendo formulario de emisión...")
+        for intento in range(2):
+            self.frame.locator("#btnNew").click()
+            try:
+                self.frame.locator("#Wcr_PW-1").wait_for(state="visible", timeout=self.timeout_ms)
+                self.frame.locator("#Wcr_txtcodCliente").wait_for(state="visible", timeout=self.timeout_ms)
+                self._esperar_sin_loading()
+                logger.info("✅ Modal #Wcr_PW-1 abierto")
+                return
+            except PlaywrightTimeoutError:
+                if intento == 0:
+                    logger.warning("⚠️ #Wcr_PW-1 no abrió al primer clic; reintentando...")
+                    self.page.wait_for_timeout(1000)
+                else:
+                    raise
 
     def buscar_cliente(self, codigo_cliente: str):
         """Paso 4: escribe hasta 6 caracteres en #Wcr_txtcodCliente y presiona Tab."""
         busqueda = codigo_cliente.strip()[:6]
         logger.info(f"Buscando cliente en #Wcr_txtcodCliente: '{busqueda}' (completo: {codigo_cliente})")
+        self.mostrar_hud("Paso 1: Cliente", f"Buscando código '{busqueda}'...")
 
         campo = self.frame.locator("#Wcr_txtcodCliente")
         campo.fill(busqueda)
         campo.press("Tab")
+        campo.evaluate("el => el.blur()")
+        self._esperar_sin_loading()
 
-        # Esperar opciones en #Wcr_cmbClientes
+        # Esperar opciones válidas en #Wcr_cmbClientes
         self.frame.locator("#Wcr_cmbClientes option").first.wait_for(state="attached", timeout=self.timeout_ms)
-        self.page.wait_for_timeout(800)
+        self.page.wait_for_timeout(600)
         logger.info("✅ Cliente(s) cargado(s) en #Wcr_cmbClientes")
 
     def seleccionar_cliente_final(self, codigo_cliente: str = "", nombre_cliente: str = ""):
@@ -295,7 +412,7 @@ class PhoenixAutomation:
         for texto in opciones:
             if any(obj in texto.lower() for obj in objetivos):
                 cmb.select_option(label=texto)
-                self.page.wait_for_timeout(1200)
+                self._esperar_sin_loading()
                 logger.info(f"✅ Cliente final seleccionado: {texto}")
                 return True
 
@@ -304,6 +421,7 @@ class PhoenixAutomation:
 
     def seleccionar_producto(self, producto: str = ""):
         """Error 1 del manual: seleccionar producto (#Wcr_idRegProducto) ANTES de editar fechas."""
+        self.mostrar_hud("Paso 2: Producto", f"Seleccionando '{producto or 'por defecto'}'...")
         cmb = self.frame.locator("#Wcr_idRegProducto")
         cmb.locator("option").first.wait_for(state="attached", timeout=self.timeout_ms)
 
@@ -317,7 +435,7 @@ class PhoenixAutomation:
             for val, txt in opciones:
                 if prod_lower in txt.lower() or prod_lower == val.lower():
                     cmb.select_option(value=val)
-                    self.page.wait_for_timeout(1200)
+                    self._esperar_sin_loading()
                     logger.info(f"✅ Producto seleccionado: {txt}")
                     return
             logger.warning(f"⚠️ No se encontró producto '{producto}' en #Wcr_idRegProducto")
@@ -327,7 +445,7 @@ class PhoenixAutomation:
                 for val, txt in opciones:
                     if val and val != "-1" and txt:
                         cmb.select_option(value=val)
-                        self.page.wait_for_timeout(1200)
+                        self._esperar_sin_loading()
                         logger.info(f"✅ Producto por defecto seleccionado: {txt}")
                         return
 
@@ -337,12 +455,13 @@ class PhoenixAutomation:
         dispara Tab + blur para activar el callback DevExpress y selecciona Zona (#cmbZona) si existe.
         """
         logger.info(f"Completando vigencia: {fecha_inicio} -> {fecha_fin}")
-        self.ultima_alerta = None
+        self.mostrar_hud("Paso 3: Vigencia", f"{fecha_inicio} al {fecha_fin}")
+        self._limpiar_alertas()
 
         f_ini = self.frame.locator("#Wcr_txtFhInicio")
         f_ini.fill(fecha_inicio)
         f_ini.press("Tab")
-        self.page.wait_for_timeout(600)
+        self._esperar_sin_loading()
 
         f_fin = self.frame.locator("#Wcr_txtFhFin")
         es_readonly = f_fin.get_attribute("readonly") is not None or "inputDisabled" in (f_fin.get_attribute("class") or "")
@@ -350,7 +469,8 @@ class PhoenixAutomation:
         if not es_readonly and f_fin.is_enabled():
             f_fin.fill(fecha_fin)
             f_fin.press("Tab")
-            self.page.wait_for_timeout(600)
+            f_fin.evaluate("el => el.blur()")
+            self._esperar_sin_loading()
         else:
             dias = _calcular_dias_inclusivos(fecha_inicio, fecha_fin)
             dur_input = self.frame.locator("#Wcr_txtDuracionDias")
@@ -359,14 +479,17 @@ class PhoenixAutomation:
                 dur_input.fill(str(dias))
                 dur_input.press("Tab")
                 dur_input.evaluate("el => el.blur()")
-                self.page.wait_for_timeout(1500)
+                self._esperar_sin_loading()
                 logger.info(f"Duración establecida en {dias} días (#Wcr_txtDuracionDias)")
             elif dur_select.count() > 0 and dur_select.is_visible() and dias:
                 for opt in dur_select.locator("option").all():
                     if str(dias) in opt.inner_text():
                         dur_select.select_option(value=opt.get_attribute("value"))
                         break
-                self.page.wait_for_timeout(1200)
+                self._esperar_sin_loading()
+
+        if self.alertas:
+            logger.warning(f"⚠️ Alerta(s) durante vigencia: {' | '.join(self.alertas)}")
 
         if zona:
             cmb_zona = self.frame.locator("#cmbZona")
@@ -374,7 +497,7 @@ class PhoenixAutomation:
                 for opt in cmb_zona.locator("option").all():
                     if zona.strip().lower() in opt.inner_text().lower():
                         cmb_zona.select_option(value=opt.get_attribute("value"))
-                        self.page.wait_for_timeout(600)
+                        self._esperar_sin_loading()
                         logger.info(f"✅ Zona seleccionada: {opt.inner_text().strip()}")
                         break
 
@@ -523,25 +646,67 @@ class PhoenixAutomation:
             logger.info("ℹ️ Campo File1 no presente en este producto/entorno")
 
     def terminar_emision(self) -> tuple[bool, str]:
-        """Paso 10: clic en #Wcr_btnAceptar, verifica errores y recarga grilla si el modal queda pendiente."""
+        """Paso 10: clic en #Wcr_btnAceptar, detecta alertas/errores de modal y espera confirmación real."""
         logger.info("Finalizando emisión (#Wcr_btnAceptar)...")
-        self.ultima_alerta = None
+        self.mostrar_hud("Confirmando Emisión", "Enviando contrato a Phoenix...")
+        self._limpiar_alertas()
 
-        self.frame.locator("#Wcr_btnAceptar").click()
-        self.page.wait_for_timeout(4500)
+        btn_aceptar = self.frame.locator("#Wcr_btnAceptar")
+        btn_aceptar.click()
 
-        if self.ultima_alerta:
-            alerta_lower = self.ultima_alerta.lower()
-            if "actualmente existe" in alerta_lower or "error" in alerta_lower:
-                return False, self.ultima_alerta
-
-        # Si el modal sigue visible tras deshabilitarse Aceptar (observado en PRE), recargar listaContratos.aspx
         modal = self.frame.locator("#Wcr_PW-1")
-        if modal.count() > 0 and modal.is_visible():
-            logger.info("Modal aún abierto tras Aceptar; recargando listaContratos.aspx para verificar...")
-            self.ir_a_emision_vouchers()
+        deadline = time.monotonic() + (self.timeout_ms / 1000.0)
+        ok_confirmado = False
 
-        return True, ""
+        while time.monotonic() < deadline:
+            self.page.wait_for_timeout(500)
+
+            for al in list(self.alertas):
+                al_low = al.lower()
+                if any(
+                    kw in al_low
+                    for kw in (
+                        "actualmente existe",
+                        "error",
+                        "obligatorio",
+                        "debe ",
+                        "inválid",
+                        "invalid",
+                        "incorrecto",
+                        "no puede",
+                        "revise",
+                    )
+                ):
+                    self._capturar_screenshot("error_alerta_aceptar")
+                    return False, " | ".join(self.alertas)
+                if al_low.strip() == "ok" or "correctamente" in al_low:
+                    ok_confirmado = True
+
+            if modal.count() == 0 or not modal.is_visible():
+                logger.info("✅ Modal #Wcr_PW-1 cerrado tras Aceptar")
+                return True, ""
+
+            errores_ui = self._detectar_errores_visibles_modal()
+            if errores_ui:
+                self._capturar_screenshot("error_validacion_modal")
+                return False, " | ".join(errores_ui)
+
+            # En PRE, tras la alerta 'OK', el modal a veces queda abierto con #Wcr_btnAceptar deshabilitado
+            try:
+                if ok_confirmado and not btn_aceptar.is_enabled():
+                    logger.info("Confirmación 'OK' recibida y botón Aceptar deshabilitado; recargando grilla...")
+                    self.ir_a_emision_vouchers()
+                    return True, ""
+            except Exception:
+                pass
+
+        if ok_confirmado:
+            logger.info("Modal aún abierto tras confirmación 'OK'; recargando listaContratos.aspx...")
+            self.ir_a_emision_vouchers()
+            return True, ""
+
+        self._capturar_screenshot("timeout_terminar_emision")
+        return False, "Timeout esperando confirmación de emisión en #Wcr_PW-1 (revisar captura en screenshots/)."
 
     def obtener_precios(self, tipo_viaje: str = "internacional") -> dict:
         """
@@ -600,14 +765,24 @@ class PhoenixAutomation:
 
         modal = self.frame.locator("#Wcr_PW-1")
         if modal.count() == 0 or not modal.is_visible():
+            self.mostrar_hud("Descargando Voucher", "Reabriendo voucher emitido en grilla...")
             soc_filtro = self.config.get("sociedad_grilla_filtro", "CHILE")
             if soc_filtro:
                 self.seleccionar_sociedad_grilla(soc_filtro)
             fila0 = self.frame.locator("tr[id*='DXDataRow0']").first
             fila0.wait_for(state="visible", timeout=self.timeout_ms)
-            fila0.dblclick()
-            modal.wait_for(state="visible", timeout=self.timeout_ms)
-            self.page.wait_for_timeout(1200)
+            for intento in range(2):
+                fila0.dblclick()
+                try:
+                    modal.wait_for(state="visible", timeout=10000)
+                    break
+                except PlaywrightTimeoutError:
+                    if intento == 0:
+                        logger.warning("⚠️ Primer doble clic no abrió #Wcr_PW-1; reintentando...")
+                        self._esperar_sin_loading(5000)
+                    else:
+                        raise
+            self._esperar_sin_loading()
 
         num_base = self.frame.locator("#Wcr_txtNpoliza").input_value().strip()
         suf_val = self.frame.locator("#Wcr_txtSufijo").input_value().strip() if self.frame.locator("#Wcr_txtSufijo").count() > 0 else ""
@@ -640,7 +815,7 @@ class PhoenixAutomation:
             return numero_voucher, None
 
         try:
-            with self.page.expect_download(timeout=25000) as dl_info:
+            with self.page.expect_download(timeout=max(self.timeout_ms, 45000)) as dl_info:
                 boton_descarga.click()
             download = dl_info.value
             download.save_as(ruta_destino)
@@ -657,6 +832,7 @@ class PhoenixAutomation:
         dry_run: bool = False,
         enviar_correo_asegurado: bool | None = None,
         email_modo: str | None = None,
+        confirmar_antes_aceptar: bool = False,
     ) -> dict:
         """
         Ejecuta la emisión completa con Playwright, captura el PDF del voucher
@@ -703,12 +879,21 @@ class PhoenixAutomation:
                 self.completar_file(datos.file1)
 
             if dry_run:
+                self.mostrar_hud("Dry-Run Completo", "Revisando precios antes de cancelar...")
                 resultado["precios"] = self.obtener_precios(datos.tipo_viaje)
                 self._capturar_screenshot("dry_run_antes_aceptar")
                 self.frame.locator("#Wcr_btnCancelar").click()
                 resultado["exito"] = True
                 resultado["resumen"] = "Dry-run completado con Playwright sin emitir."
                 return resultado
+
+            if confirmar_antes_aceptar:
+                self.mostrar_hud("Esperando Confirmación", "Revisa la pantalla y confirma en consola para emitir.")
+                resp = input("\n👀 Revisa los datos cargados en Phoenix. ¿Confirmar emisión (Aceptar)? (s/n) [s]: ").strip().lower()
+                if resp == "n":
+                    self.frame.locator("#Wcr_btnCancelar").click()
+                    resultado["error"] = "Emisión cancelada manualmente por el usuario antes de Aceptar."
+                    return resultado
 
             exito, err_msg = self.terminar_emision()
             if not exito:

@@ -21,7 +21,7 @@ from datetime import datetime
 import openpyxl
 
 from phoenix_emision import PhoenixAutomation, DatosEmision, Pasajero
-from emision_grupal import PhoenixEmisionGrupal
+from emision_grupal import PhoenixEmisionGrupal, _cargar_workbook_seguro
 from utils import buscar_dealer_por_codigo, buscar_dealer_por_correo, limpiar_rut
 
 
@@ -99,7 +99,7 @@ def _formatear_fecha(val) -> str:
 
 def cargar_solicitudes(ruta_excel: str) -> list[dict]:
     """Lee el Excel y agrupa las filas por solicitud_id."""
-    wb = openpyxl.load_workbook(ruta_excel, data_only=True)
+    wb = _cargar_workbook_seguro(ruta_excel)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     if len(rows) < 2:
