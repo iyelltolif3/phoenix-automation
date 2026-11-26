@@ -6,6 +6,7 @@ Funciones de búsqueda de dealers, formateo de datos y validación.
 import json
 import os
 import re
+import unicodedata
 from datetime import datetime
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
@@ -98,6 +99,49 @@ def determinar_producto(nombre_agencia: str, tipo_viaje: str = "nacional") -> st
         return masai["internacional"] if tipo_viaje.lower() == "internacional" else masai["nacional"]
     
     return None  # Producto estándar, seleccionado por Phoenix
+
+
+def normalizar_texto(texto: str) -> str:
+    """Minúsculas y sin tildes, para comparar etiquetas y destinos sin depender de la ortografía."""
+    base = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(c for c in base if not unicodedata.combining(c)).lower()
+
+
+# Región de Phoenix (texto de la opción de #CMBDESTINOSV) -> términos que la identifican.
+# El orden importa: la primera región con coincidencia gana.
+REGIONES_DESTINO: list[tuple[str, tuple[str, ...]]] = [
+    ("ESTADOS UNIDOS", ("eeuu", "ee.uu", "usa", "estados unidos", "miami", "orlando", "nueva york",
+                        "new york", "las vegas", "los angeles", "canada")),
+    ("EUROPA", ("europa", "schengen", "espana", "francia", "italia", "paris", "madrid", "barcelona",
+                "roma", "londres", "alemania", "portugal", "grecia", "inglaterra")),
+    ("TODO EL MUNDO", ("todo el mundo",)),
+    ("LATAM", ("latam", "latinoamerica", "sudamerica", "argentina", "bariloche", "buenos aires",
+               "mendoza", "brasil", "rio de janeiro", "florianopolis", "peru", "cusco", "colombia",
+               "mexico", "cancun", "caribe", "cuba", "punta cana", "uruguay", "paraguay", "bolivia",
+               "ecuador")),
+]
+
+
+def _contiene_termino(texto_norm: str, termino: str) -> bool:
+    """Coincidencia por palabra completa ('rio' no debe coincidir con 'varios')."""
+    return re.search(rf"(?<![a-z0-9]){re.escape(termino)}(?![a-z0-9])", texto_norm) is not None
+
+
+def inferir_region_destino(texto: str) -> str:
+    """Devuelve la región de Phoenix (ESTADOS UNIDOS/EUROPA/TODO EL MUNDO/LATAM) o '' si no se reconoce."""
+    t = normalizar_texto(texto)
+    for region, terminos in REGIONES_DESTINO:
+        if any(_contiene_termino(t, term) for term in terminos):
+            return region
+    return ""
+
+
+def es_destino_internacional(texto: str) -> bool:
+    """True si el texto menciona un destino fuera de Chile (por palabra completa)."""
+    t = normalizar_texto(texto)
+    if _contiene_termino(t, "internacional"):
+        return True
+    return bool(inferir_region_destino(texto))
 
 
 def tipo_documento_codigo(tipo: str) -> int:

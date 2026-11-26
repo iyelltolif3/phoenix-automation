@@ -715,11 +715,16 @@ class PhoenixAutomation:
         if not seleccionado:
             cmb_tipo.select_option(value=str(tipo_documento_codigo(tipo_upper)))
 
-        # Documento y DV
-        self.frame.locator(f"#txtIdFiscal_{indice}").fill(pasajero.numero_documento.strip())
+        # Documento y DV: con campo #txtDV_n va separado; sin él (ej. producto 3392) el DV va como NNNNNNNN-D
+        numero = pasajero.numero_documento.strip()
+        dv = pasajero.digito_verificador.strip().upper()
         dv_loc = self.frame.locator(f"#txtDV_{indice}")
-        if dv_loc.count() > 0 and dv_loc.is_visible():
-            dv_loc.fill(pasajero.digito_verificador.strip() if tipo_upper == "RUN" else "")
+        tiene_dv_separado = dv_loc.count() > 0 and dv_loc.is_visible()
+        if tipo_upper == "RUN" and dv and not tiene_dv_separado:
+            numero = f"{numero}-{dv}"
+        self.frame.locator(f"#txtIdFiscal_{indice}").fill(numero)
+        if tiene_dv_separado:
+            dv_loc.fill(dv if tipo_upper == "RUN" else "")
 
         # Nombres y Apellidos
         self.frame.locator(f"#txtNmAsegurado_{indice}").fill(pasajero.nombre.strip().upper())
@@ -739,6 +744,12 @@ class PhoenixAutomation:
                 edad = _calcular_edad(pasajero.fecha_nacimiento)
                 if edad is not None:
                     edad_loc.fill(str(edad))
+                    if edad_loc.input_value().strip() != str(edad):
+                        # maxlength=0 en el input: fill() no escribe, se asigna por DOM
+                        edad_loc.evaluate(
+                            "(el, v) => { el.value = v; el.dispatchEvent(new Event('change', {bubbles: true})); }",
+                            str(edad),
+                        )
                     edad_loc.press("Tab")
                     self.page.wait_for_timeout(400)
 
@@ -806,6 +817,13 @@ class PhoenixAutomation:
 
             for al in list(self.alertas):
                 al_low = al.lower()
+                if "xsltprocessor" in al_low:
+                    self._capturar_screenshot("error_xslt")
+                    return False, (
+                        "Phoenix necesita XSLT (XSLTProcessor) y este navegador ya no lo incluye "
+                        "(Chrome/Edge 158+ lo eliminaron). Usa un navegador/versión con XSLT habilitado "
+                        f"o la política empresarial correspondiente. Alerta original: {al}"
+                    )
                 if any(
                     kw in al_low
                     for kw in (
