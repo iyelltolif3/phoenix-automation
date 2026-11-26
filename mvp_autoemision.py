@@ -17,16 +17,20 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 
-from phoenix_emision import DatosEmision, Pasajero, PhoenixAutomation, _calcular_edad
+from phoenix_emision import DatosEmision, Pasajero, PhoenixAutomation, _calcular_edad, _parsear_fecha_phoenix
 from emision_grupal import PhoenixEmisionGrupal, validar_excel_grupal
 from utils import (
     BASE_DIR,
+    buscar_dealer_por_codigo,
     buscar_dealer_por_correo,
     buscar_dealer_por_nombre,
     cargar_config,
     determinar_producto,
+    es_destino_internacional,
     formatear_file_nacional,
+    inferir_region_destino,
     limpiar_rut,
+    normalizar_texto,
     validar_rut_modulo11,
 )
 
@@ -177,68 +181,181 @@ def extraer_desde_eml(ruta_eml: str) -> dict:
     }
 
 
-def _parsear_rango_fechas(texto: str, ref_dt: datetime | None = None) -> tuple[str, str]:
-    """Detecta rangos de fechas en español o DD/MM/AAAA."""
-    anio_base = (ref_dt or datetime.now()).year
+_MESES_PAT = "|".join(sorted((re.escape(k) for k in MESES_ES), key=len, reverse=True))
+_SEP = r"\s*(?:al|hasta|a|-|–|—)\s*(?:el\s+)?(?:d[ií]a\s+)?"
+_FECHA_NUM = r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+_DIA_MES_TXT = rf"(\d{{1,2}})\s*(?:de\s*)?({_MESES_PAT})\b(?:\s*(?:de|del)?\s*(\d{{4}}))?"
 
-    # 1. Formato numérico: 27/11/2026 al 29/11/2026 (o con guiones)
-    m_num = re.search(
-        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|hasta|-|a)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        texto,
-        re.IGNORECASE,
-    )
-    if m_num:
-        def _norm_d(s: str) -> str:
-            s = s.replace("-", "/")
+
+def _fecha_valida(d: int, m: int, y: int) -> datetime | None:
+    try:
+        return datetime(y, m, d)
+    except ValueError:
+        return None
+
+
+def _anio_para(d: int, m: int, ref: datetime) -> int:
+    """Año de una fecha sin año: el de la fecha del correo, o el siguiente si ya quedó muy atrás."""
+    y = ref.year
+    cand = _fecha_valida(d, m, y)
+    if cand and (ref - cand).days > 60:
+        y += 1
+    return y
+
+
+def _fmt(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y")
+
+
+def _parsear_rango_fechas(texto: str, ref_dt: datetime | None = None) -> tuple[str, str]:
+    """
+    Detecta rangos de fechas en el texto. Soporta:
+    '27/11/2026 al 29/11/2026', '27-11-26 - 29-11-26', '27/11 al 29/11',
+    '30 noviembre al 4 diciembre', 'del 27 de noviembre hasta el 29 de noviembre de 2026',
+    'del 27 al 29 de noviembre'. Devuelve ('', '') si no hay un rango válido.
+    """
+    ref = ref_dt.replace(tzinfo=None) if ref_dt else datetime.now()
+    t = normalizar_texto(texto)
+
+    # 1. Numérico con año
+    m = re.search(rf"({_FECHA_NUM}){_SEP}({_FECHA_NUM})", t)
+    if m:
+        def _norm_d(sv: str) -> datetime | None:
+            sv = sv.replace("-", "/")
             for fmt in ("%d/%m/%Y", "%d/%m/%y"):
                 try:
-                    return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
+                    return datetime.strptime(sv, fmt)
                 except ValueError:
                     continue
-            return s
-        return _norm_d(m_num.group(1)), _norm_d(m_num.group(2))
+            return None
+        a, b = _norm_d(m.group(1)), _norm_d(m.group(2))
+        if a and b:
+            return _fmt(a), _fmt(b)
 
-    # 2. Formato texto español: "30 noviembre al 4 diciembre [2026]"
-    meses_pat = "|".join(MESES_ES.keys())
-    m_es = re.search(
-        rf"(\d{{1,2}})\s*(?:de\s*)?({meses_pat})(?:\s*(?:de|del)?\s*(\d{{4}}))?\s*(?:al|hasta|-|a)\s*(\d{{1,2}})\s*(?:de\s*)?({meses_pat})(?:\s*(?:de|del)?\s*(\d{{4}}))?",
-        texto,
-        re.IGNORECASE,
-    )
-    if m_es:
-        d1 = int(m_es.group(1))
-        m1 = MESES_ES[m_es.group(2).lower()]
-        y1 = int(m_es.group(3)) if m_es.group(3) else anio_base
-        d2 = int(m_es.group(4))
-        m2 = MESES_ES[m_es.group(5).lower()]
-        y2 = int(m_es.group(6)) if m_es.group(6) else y1
-        if not m_es.group(6) and m2 < m1:
-            y2 += 1
-        return f"{d1:02d}/{m1:02d}/{y1}", f"{d2:02d}/{m2:02d}/{y2}"
+    # 2. Numérico sin año: 27/11 al 29/11
+    m = re.search(rf"(?<![\d/-])(\d{{1,2}})[/-](\d{{1,2}}){_SEP}(\d{{1,2}})[/-](\d{{1,2}})(?![\d/-])", t)
+    if m:
+        d1, m1, d2, m2 = (int(m.group(i)) for i in range(1, 5))
+        y1 = _anio_para(d1, m1, ref)
+        y2 = y1 + 1 if (m2, d2) < (m1, d1) else y1
+        a, b = _fecha_valida(d1, m1, y1), _fecha_valida(d2, m2, y2)
+        if a and b:
+            return _fmt(a), _fmt(b)
+
+    # 3. Texto con dos meses: 30 noviembre al 4 diciembre [2026]
+    m = re.search(rf"{_DIA_MES_TXT}{_SEP}{_DIA_MES_TXT}", t)
+    if m:
+        d1, m1 = int(m.group(1)), MESES_ES[m.group(2)]
+        d2, m2 = int(m.group(4)), MESES_ES[m.group(5)]
+        y1 = int(m.group(3)) if m.group(3) else _anio_para(d1, m1, ref)
+        if m.group(6):
+            y2 = int(m.group(6))
+        else:
+            y2 = y1 + 1 if (m2, d2) < (m1, d1) else y1
+        a, b = _fecha_valida(d1, m1, y1), _fecha_valida(d2, m2, y2)
+        if a and b:
+            return _fmt(a), _fmt(b)
+
+    # 4. Mismo mes: del 27 al 29 de noviembre [de 2026]
+    m = re.search(rf"(?<![\d/-])(\d{{1,2}}){_SEP}(\d{{1,2}})\s*(?:de\s*)?({_MESES_PAT})\b(?:\s*(?:de|del)?\s*(\d{{4}}))?", t)
+    if m:
+        d1, d2, mes = int(m.group(1)), int(m.group(2)), MESES_ES[m.group(3)]
+        y = int(m.group(4)) if m.group(4) else _anio_para(d2, mes, ref)
+        a, b = _fecha_valida(d1, mes, y), _fecha_valida(d2, mes, y)
+        if a and b:
+            return _fmt(a), _fmt(b)
 
     return "", ""
 
 
+def _label_regex(etiqueta: str) -> str:
+    """Patrón de una etiqueta tolerante a tildes y mayúsculas (Codigo/Código, Cod./Cód.)."""
+    base = re.escape(normalizar_texto(etiqueta))
+    for vocal, clase in (("a", "[aáàä]"), ("e", "[eéèë]"), ("i", "[iíìï]"), ("o", "[oóòö]"), ("u", "[uúùü]"), ("n", "[nñ]")):
+        base = base.replace(vocal, clase)
+    return base
+
+
 def _extraer_campo_tabla_o_texto(texto: str, tablas: list[list[list[str]]], etiquetas: list[str]) -> str:
-    """Busca primero en tablas HTML clave-valor y luego en líneas del texto."""
-    etq_low = [e.lower() for e in etiquetas]
+    """Busca primero en tablas HTML clave-valor y luego en líneas del texto (sin depender de tildes)."""
+    etq_norm = [normalizar_texto(e) for e in etiquetas]
     for tbl in tablas:
         for row in tbl:
             if len(row) >= 2:
-                k = row[0].strip().lower().rstrip(":")
-                if any(e == k or e in k for e in etq_low):
+                k = normalizar_texto(row[0]).strip().rstrip(":").strip()
+                if any(e == k or e in k for e in etq_norm):
                     val = row[1].strip()
                     if val:
                         return val
 
     for etq in etiquetas:
-        m = re.search(rf"(?im)^\s*{re.escape(etq)}\s*[:\t]+\s*([^\r\n]+)", texto)
+        pat = _label_regex(etq)
+        m = re.search(rf"(?im)^\s*{pat}\s*[:\t]+\s*([^\r\n]+)", texto)
         if m and m.group(1).strip():
             return m.group(1).strip()
-        m2 = re.search(rf"(?im)^\s*{re.escape(etq)}\s*\r?\n\s*([^\r\n]+)", texto)
+        m2 = re.search(rf"(?im)^\s*{pat}\s*\r?\n\s*([^\r\n]+)", texto)
         if m2 and m2.group(1).strip():
             return m2.group(1).strip()
     return ""
+
+
+def _aplanar_tablas(tablas: list[list[list[str]]]) -> str:
+    """Texto plano de las tablas (una fila por línea), para buscar fechas que vengan dentro de ellas."""
+    return "\n".join(" ".join(c for c in row if c) for tbl in tablas for row in tbl)
+
+
+_CODIGO_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2}(?:\d{3,}|\.[A-Za-z0-9]+))(?![A-Za-z0-9])")
+
+
+def _prefijos_codigo_conocidos() -> set[str]:
+    """Prefijos de código de cliente (SV, PC, WX, MV...) sacados del catálogo de dealers + los conocidos."""
+    prefijos = {"WX", "SV", "PC", "MV"}
+    try:
+        for d in cargar_config().get("dealers", []):
+            cod = str(d.get("codigo", ""))
+            if re.match(r"^[A-Za-z]{2}\d", cod):
+                prefijos.add(cod[:2].upper())
+    except Exception:
+        pass
+    return prefijos
+
+
+def _normalizar_codigo_cliente(valor: str) -> tuple[str, str]:
+    """
+    Separa el valor de un campo 'cliente' en (código, nombre).
+    'WX01526 TURISMO RAYS' -> ('WX01526', 'TURISMO RAYS'); 'Colegio San Pedro' -> ('', 'Colegio San Pedro');
+    un valor de una sola palabra (ej. 'PARANCIB@cverde.cl') se conserva como código.
+    """
+    v = (valor or "").strip()
+    if not v:
+        return "", ""
+    m = _CODIGO_RE.search(v)
+    if m:
+        codigo = m.group(1).upper()
+        nombre = re.sub(r"\s*[-–:]\s*$", "", v.replace(m.group(1), "", 1)).strip(" -–:")
+        return codigo, nombre
+    if len(v.split()) == 1:
+        return v, ""
+    return "", v
+
+
+def _buscar_codigo_en_texto(texto: str) -> str:
+    """Último recurso: busca en el texto libre un código con prefijo conocido (ej. WX01526)."""
+    prefijos = _prefijos_codigo_conocidos()
+    for m in _CODIGO_RE.finditer(texto):
+        if m.group(1)[:2].upper() in prefijos:
+            return m.group(1).upper()
+    return ""
+
+
+def _buscar_destino_en_texto(texto: str) -> str:
+    """Último recurso para correos sin etiquetas: 'viaje a Bariloche del 27...' -> 'Bariloche'."""
+    m = re.search(
+        r"(?i)\b(?:viaje|viajan|viajar|viajaran|destino|rumbo)\s+(?:a|al|hacia|con destino a)\s+"
+        r"([A-ZÁÉÍÓÚÑa-záéíóúñ][A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40}?)(?=\s+(?:del|desde|entre|el|para|con|durante)\b|[,.;\n]|\s*$)",
+        texto,
+    )
+    return m.group(1).strip() if m else ""
 
 
 def _pasajeros_desde_tablas(tablas: list[list[list[str]]]) -> list[Pasajero]:
@@ -311,16 +428,25 @@ def parsear_solicitud_correo(
     texto_completo = f"{asunto}\n{texto}"
 
     # 1. Cliente / Dealer
-    codigo_cliente = _extraer_campo_tabla_o_texto(
-        texto, tablas, ["EMITIR BAJO CLIENTE", "COD CLIENTE", "CODIGO CLIENTE", "CLIENTE"]
+    valor_cliente = _extraer_campo_tabla_o_texto(
+        texto,
+        tablas,
+        [
+            "EMITIR BAJO CLIENTE", "EMITIR BAJO", "COD CLIENTE", "COD. CLIENTE", "CODIGO CLIENTE",
+            "CODIGO DE CLIENTE", "CLIENTE",
+        ],
     )
+    codigo_cliente, nombre_en_cliente = _normalizar_codigo_cliente(valor_cliente)
+    if not codigo_cliente:
+        codigo_cliente = _buscar_codigo_en_texto(texto_completo + "\n" + _aplanar_tablas(tablas))
+
     producto = _extraer_campo_tabla_o_texto(texto, tablas, ["Producto", "Plan"])
     negocio = _extraer_campo_tabla_o_texto(
         texto, tablas, ["N° de negocio", "N° negocio", "Numero de negocio", "File", "File1", "Booking", "Expediente"]
     )
     origen = _extraer_campo_tabla_o_texto(texto, tablas, ["Origen"]) or "SANTIAGO"
-    destino_raw = _extraer_campo_tabla_o_texto(texto, tablas, ["Destino"])
-    colegio = _extraer_campo_tabla_o_texto(texto, tablas, ["Colegio", "Empresa", "Sociedad"])
+    destino_raw = _extraer_campo_tabla_o_texto(texto, tablas, ["Destino"]) or _buscar_destino_en_texto(texto_completo)
+    colegio = _extraer_campo_tabla_o_texto(texto, tablas, ["Colegio", "Empresa", "Sociedad"]) or nombre_en_cliente
 
     agencia = ""
     if remitente:
@@ -330,20 +456,38 @@ def parsear_solicitud_correo(
             if not codigo_cliente:
                 codigo_cliente = matches[0]["codigo"]
 
+    if codigo_cliente and not agencia:
+        dealer = buscar_dealer_por_codigo(codigo_cliente)
+        if dealer:
+            agencia = dealer["agencia"]
+
     if not codigo_cliente and colegio:
         matches_nom = buscar_dealer_por_nombre(colegio)
         if matches_nom:
             codigo_cliente = matches_nom[0]["codigo"]
             agencia = matches_nom[0]["agencia"]
 
-    # 2. Vigencia
+    # 2. Vigencia (texto del correo + asunto + contenido de las tablas + campos etiquetados)
     fecha_inicio, fecha_fin = _parsear_rango_fechas(texto_completo, ref_dt=fecha_correo)
+    if not (fecha_inicio and fecha_fin):
+        extra = _extraer_campo_tabla_o_texto(
+            texto, tablas, ["Vigencia", "Fechas", "Fecha de viaje", "Fechas de viaje", "Periodo", "Periodo de viaje"]
+        )
+        ini_txt = _extraer_campo_tabla_o_texto(texto, tablas, ["Fecha inicio", "Fecha de inicio", "Desde", "Salida"])
+        fin_txt = _extraer_campo_tabla_o_texto(texto, tablas, ["Fecha fin", "Fecha de fin", "Fecha termino", "Hasta", "Regreso"])
+        candidatos = [extra, f"{ini_txt} al {fin_txt}" if ini_txt and fin_txt else "", _aplanar_tablas(tablas)]
+        for cand in candidatos:
+            if cand:
+                fecha_inicio, fecha_fin = _parsear_rango_fechas(cand, ref_dt=fecha_correo)
+                if fecha_inicio and fecha_fin:
+                    break
 
     # 3. Tipo de viaje / Destino Phoenix
-    dest_lower = f"{destino_raw} {asunto}".lower()
-    es_internacional = any(hint in dest_lower for hint in DESTINOS_INTERNACIONALES_HINT)
+    texto_destino = f"{destino_raw} {asunto}"
+    es_internacional = es_destino_internacional(texto_destino)
     tipo_viaje = "internacional" if es_internacional else "nacional"
-    destino_combo = "" if es_internacional else "CL - NACIONAL"
+    # Internacional: región de Phoenix (LATAM/EUROPA/ESTADOS UNIDOS/TODO EL MUNDO) o '' si no se reconoce.
+    destino_combo = inferir_region_destino(texto_destino) if es_internacional else "CL - NACIONAL"
     lista_destino = destino_raw.split("(")[0].strip().rstrip(".").upper() if destino_raw else ""
 
     if not producto and (agencia or codigo_cliente):
@@ -416,6 +560,20 @@ def auditar_solicitud_mvp(parsed: dict) -> dict:
         errores.append("No se pudo determinar la fecha de inicio y/o fin de vigencia.")
     if not datos.lista_destino and not datos.destino:
         errores.append("Falta el destino del viaje.")
+    if datos.tipo_viaje == "internacional" and not datos.destino:
+        errores.append(
+            "Viaje internacional sin región de destino de Phoenix (LATAM, EUROPA, ESTADOS UNIDOS o TODO EL MUNDO): "
+            "indícala con la opción 3 (Editar datos)."
+        )
+    if datos.fecha_inicio and datos.fecha_fin:
+        f_ini = _parsear_fecha_phoenix(datos.fecha_inicio)
+        f_fin = _parsear_fecha_phoenix(datos.fecha_fin)
+        if not f_ini or not f_fin:
+            errores.append(f"Fechas de vigencia con formato inválido: '{datos.fecha_inicio}' -> '{datos.fecha_fin}'.")
+        elif f_fin < f_ini:
+            errores.append(f"La vigencia termina ({datos.fecha_fin}) antes de empezar ({datos.fecha_inicio}).")
+        elif f_ini.date() < datetime.now().date():
+            advertencias.append(f"La vigencia empieza en el pasado ({datos.fecha_inicio}); Phoenix puede rechazarla.")
     if not datos.pasajeros:
         errores.append("No hay pasajeros cargados (adjunta Excel válido o tabla de pasajeros).")
 
@@ -497,6 +655,7 @@ def _editar_campos_manuales(parsed: dict):
     d.fecha_fin = input(f"  Fecha fin (DD/MM/AAAA) [{d.fecha_fin}]: ").strip() or d.fecha_fin
     d.tipo_viaje = (input(f"  Tipo viaje (nacional/internacional) [{d.tipo_viaje}]: ").strip().lower() or d.tipo_viaje)
     d.lista_destino = input(f"  Lista destino [{d.lista_destino}]: ").strip() or d.lista_destino
+    d.destino = input(f"  Destino Phoenix (ej. LATAM, EUROPA, CL - NACIONAL) [{d.destino}]: ").strip() or d.destino
     d.file1 = input(f"  File1 [{d.file1}]: ").strip() or d.file1
 
 

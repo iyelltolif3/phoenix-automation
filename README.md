@@ -83,3 +83,16 @@ La plantilla oficial descargada desde `#plantillaExcel` en Phoenix PRE utiliza l
 | `emitir_lote.py` | Procesamiento masivo desde `plantilla_solicitudes.xlsx` + reporte `resultados_emision_*.xlsx` |
 | `plantilla_solicitudes.xlsx` | Plantilla Excel de ejemplo |
 | `requirements.txt` | Dependencias Python del proyecto |
+
+## Pruebas
+
+```powershell
+python -m unittest discover -s tests
+```
+
+Cubren el parseo de correos del MVP (fechas, cliente, destino/región, pasajeros, `.eml` con Excel adjunto), la auditoría previa y la lógica de formulario de Phoenix (vigencia `Effect/Duration/Expiry`, pestaña de viaje T0, alta de pasajeros) con un formulario simulado. No abren Phoenix ni requieren Playwright.
+
+## Problemas conocidos
+
+- **XSLT:** Phoenix usa `XSLTProcessor` al pulsar *Aceptar*. Chrome/Edge 158+ lo eliminaron; si la emisión falla con `XSLTProcessor is not defined`, el script lo informa de forma explícita. Hay que usar un navegador/versión con XSLT habilitado (política empresarial) o que Phoenix migre ese XSLT.
+- **Destino internacional:** el MVP deduce la región de Phoenix (LATAM, EUROPA, ESTADOS UNIDOS, TODO EL MUNDO) desde el destino del correo. Si no la reconoce, la auditoría bloquea la emisión y pide indicarla en *Editar datos*; el motor nunca elige un destino al azar.
