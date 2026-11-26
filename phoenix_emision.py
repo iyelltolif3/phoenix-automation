@@ -105,6 +105,17 @@ def _calcular_dias_inclusivos(fecha_inicio: str, fecha_fin: str) -> int | None:
     return None
 
 
+def _parsear_fecha_phoenix(valor: str) -> datetime | None:
+    """Parsea fechas DD/MM/AAAA, DD-MM-AAAA o DD/MM/AA. Devuelve None si no es válida."""
+    texto = (valor or "").strip()
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(texto, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _calcular_edad(fecha_nacimiento: str, fecha_ref: str = "") -> int | None:
     """Calcula edad en años a partir de DD/MM/AAAA."""
     for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
@@ -449,47 +460,111 @@ class PhoenixAutomation:
                         logger.info(f"✅ Producto por defecto seleccionado: {txt}")
                         return
 
+    def _leer_vigencia(self) -> tuple[str, str, str]:
+        """Lee (Effect, Expiry, Duration) tal como los muestra el formulario."""
+        def _val(sel: str) -> str:
+            loc = self.frame.locator(sel)
+            return loc.input_value().strip() if loc.count() > 0 else ""
+
+        return _val("#Wcr_txtFhInicio"), _val("#Wcr_txtFhFin"), _val("#Wcr_txtDuracionDias")
+
+    def _vigencia_coincide(self, esperado_ini: datetime, esperado_fin: datetime) -> bool:
+        """True si Effect/Expiry del formulario son fechas reales (sin NaN) y coinciden con lo pedido."""
+        ini, fin, dur = self._leer_vigencia()
+        if "nan" in f"{ini} {fin} {dur}".lower():
+            return False
+        if self.frame.locator("#Wcr_txtDuracionDias").count() > 0 and not dur.isdigit():
+            return False  # Duration vacía = Phoenix no terminó de calcular la vigencia
+        f_ini, f_fin = _parsear_fecha_phoenix(ini), _parsear_fecha_phoenix(fin)
+        return bool(f_ini and f_fin and f_ini.date() == esperado_ini.date() and f_fin.date() == esperado_fin.date())
+
+    def _esperar_vigencia(self, esperado_ini: datetime, esperado_fin: datetime, espera_ms: int = 6000) -> bool:
+        """Da tiempo al callback DevExpress de recalcular Expiry/Duration antes de dar la vigencia por mala."""
+        limite = time.monotonic() + espera_ms / 1000.0
+        while time.monotonic() < limite:
+            if self._vigencia_coincide(esperado_ini, esperado_fin):
+                return True
+            self.page.wait_for_timeout(400)
+        return self._vigencia_coincide(esperado_ini, esperado_fin)
+
     def completar_vigencia(self, fecha_inicio: str, fecha_fin: str, zona: str = ""):
         """
-        Paso 5: completa Inicio (#Wcr_txtFhInicio), Fin (#Wcr_txtFhFin) o Duración (#Wcr_txtDuracionDias),
-        dispara Tab + blur para activar el callback DevExpress y selecciona Zona (#cmbZona) si existe.
+        Paso 5: completa Effect (#Wcr_txtFhInicio) y Duration (#Wcr_txtDuracionDias) / Expiry (#Wcr_txtFhFin).
+
+        Valida las fechas ANTES de tocar Phoenix y verifica DESPUES que Expiry sea una fecha real
+        (no vacía ni 'NaN') y coincida con la pedida; si no, falla con un mensaje claro en vez de
+        seguir con una vigencia inválida (que deja ocultas pestañas como #Wcr_carTabPage_T0).
         """
-        logger.info(f"Completando vigencia: {fecha_inicio} -> {fecha_fin}")
-        self.mostrar_hud("Paso 3: Vigencia", f"{fecha_inicio} al {fecha_fin}")
+        d_ini = _parsear_fecha_phoenix(fecha_inicio)
+        d_fin = _parsear_fecha_phoenix(fecha_fin)
+        if not d_ini or not d_fin:
+            raise ValueError(
+                f"Vigencia inválida: inicio='{fecha_inicio}' fin='{fecha_fin}' (se espera DD/MM/AAAA)."
+            )
+        if d_fin < d_ini:
+            raise ValueError(f"Vigencia inválida: el fin ({fecha_fin}) es anterior al inicio ({fecha_inicio}).")
+        str_ini, str_fin = d_ini.strftime("%d/%m/%Y"), d_fin.strftime("%d/%m/%Y")
+        dias = (d_fin - d_ini).days + 1
+
+        logger.info(f"Completando vigencia: {str_ini} -> {str_fin} ({dias} días)")
+        self.mostrar_hud("Paso 3: Vigencia", f"{str_ini} al {str_fin}")
         self._limpiar_alertas()
 
         f_ini = self.frame.locator("#Wcr_txtFhInicio")
-        f_ini.fill(fecha_inicio)
+        f_ini.fill(str_ini)
         f_ini.press("Tab")
         self._esperar_sin_loading()
 
         f_fin = self.frame.locator("#Wcr_txtFhFin")
-        es_readonly = f_fin.get_attribute("readonly") is not None or "inputDisabled" in (f_fin.get_attribute("class") or "")
+        dur_input = self.frame.locator("#Wcr_txtDuracionDias")
+        dur_select = self.frame.locator("#Wcr_txtDuracion")
 
-        if not es_readonly and f_fin.is_enabled():
-            f_fin.fill(fecha_fin)
-            f_fin.press("Tab")
-            f_fin.evaluate("el => el.blur()")
-            self._esperar_sin_loading()
-        else:
-            dias = _calcular_dias_inclusivos(fecha_inicio, fecha_fin)
-            dur_input = self.frame.locator("#Wcr_txtDuracionDias")
-            dur_select = self.frame.locator("#Wcr_txtDuracion")
-            if dur_input.count() > 0 and dur_input.is_visible() and dias:
+        def _por_duracion() -> bool:
+            """Escribe Duration y Tab: Phoenix calcula Expiry = Effect + Duration - 1."""
+            if dur_input.count() > 0 and dur_input.is_visible() and dur_input.is_enabled():
                 dur_input.fill(str(dias))
                 dur_input.press("Tab")
                 dur_input.evaluate("el => el.blur()")
                 self._esperar_sin_loading()
                 logger.info(f"Duración establecida en {dias} días (#Wcr_txtDuracionDias)")
-            elif dur_select.count() > 0 and dur_select.is_visible() and dias:
+                return True
+            if dur_select.count() > 0 and dur_select.is_visible():
                 for opt in dur_select.locator("option").all():
                     if str(dias) in opt.inner_text():
                         dur_select.select_option(value=opt.get_attribute("value"))
-                        break
+                        self._esperar_sin_loading()
+                        return True
+            return False
+
+        def _por_expiry() -> bool:
+            es_readonly = f_fin.get_attribute("readonly") is not None or "inputDisabled" in (f_fin.get_attribute("class") or "")
+            if f_fin.count() > 0 and not es_readonly and f_fin.is_enabled():
+                f_fin.fill(str_fin)
+                f_fin.press("Tab")
+                f_fin.evaluate("el => el.blur()")
                 self._esperar_sin_loading()
+                logger.info(f"Expiry establecido en {str_fin} (#Wcr_txtFhFin)")
+                return True
+            return False
+
+        # Duration primero (secuencia confirmada a mano en PRE); Expiry como respaldo, y viceversa.
+        ok = False
+        for metodo in (_por_duracion, _por_expiry):
+            if metodo() and self._esperar_vigencia(d_ini, d_fin):
+                ok = True
+                break
 
         if self.alertas:
             logger.warning(f"⚠️ Alerta(s) durante vigencia: {' | '.join(self.alertas)}")
+
+        if not ok:
+            ini_f, fin_f, dur_f = self._leer_vigencia()
+            self._capturar_screenshot("error_vigencia")
+            raise RuntimeError(
+                f"Phoenix no calculó una vigencia válida: pedido {str_ini}->{str_fin}, "
+                f"formulario Effect='{ini_f}' Expiry='{fin_f}' Duration='{dur_f}'."
+            )
+        logger.info(f"✅ Vigencia validada en Phoenix: {'{}'.format(' | '.join(self._leer_vigencia()))}")
 
         if zona:
             cmb_zona = self.frame.locator("#cmbZona")
@@ -501,26 +576,82 @@ class PhoenixAutomation:
                         logger.info(f"✅ Zona seleccionada: {opt.inner_text().strip()}")
                         break
 
-    def _seleccionar_en_combo(self, selector: str, texto_busqueda: str, fallback_primera_valida: bool = False):
+    def _abrir_tab(self, tab_id: str, descripcion: str = ""):
+        """
+        Activa una pestaña del contrato (ej. #Wcr_carTabPage_T0) sin esperar 35 s si está oculta:
+        intenta el clic normal 5 s y, si la pestaña existe pero está oculta/tapada, la activa por DOM.
+        """
+        tab = self.frame.locator(f"#{tab_id}")
+        if tab.count() == 0:
+            raise RuntimeError(f"La pestaña #{tab_id} {descripcion} no existe en el formulario de este producto.")
+        try:
+            tab.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            ini, fin, dur = self._leer_vigencia()
+            logger.warning(
+                f"⚠️ #{tab_id} {descripcion} no es clicable (oculta). Vigencia actual: "
+                f"Effect='{ini}' Expiry='{fin}' Duration='{dur}'. Activando por DOM..."
+            )
+            tab.evaluate("el => el.click()")
+        self.page.wait_for_timeout(500)
+
+    def _opciones_combo(self, selector: str) -> list[tuple[str, str]]:
+        """Devuelve [(value, texto)] de las opciones reales de un <select>, sin la opción vacía (-1)."""
         cmb = self.frame.locator(selector)
-        if cmb.count() == 0 or not cmb.is_visible():
-            return
-        opciones = [(opt.get_attribute("value") or "", opt.inner_text().strip()) for opt in cmb.locator("option").all()]
+        if cmb.count() == 0:
+            return []
+        return [
+            (opt.get_attribute("value") or "", opt.inner_text().strip())
+            for opt in cmb.locator("option").all()
+            if (opt.get_attribute("value") or "") not in ("", "-1") and opt.inner_text().strip()
+        ]
+
+    def _seleccionar_en_combo(
+        self,
+        selector: str,
+        texto_busqueda: str,
+        fallback_primera_valida: bool = False,
+        estricto: bool = False,
+    ) -> bool:
+        """
+        Selecciona una opción por texto/valor. Si el control no existe en el formulario de este producto
+        lo omite (devuelve False). Con `estricto=True` nunca adivina: el fallback solo se usa si hay UNA
+        única opción válida; con varias y sin coincidencia lanza un error listando las opciones.
+        """
+        cmb = self.frame.locator(selector)
+        if cmb.count() == 0:
+            logger.info(f"ℹ️ {selector} no existe en el formulario de este producto; se omite")
+            return False
+        if not cmb.is_visible():
+            logger.warning(f"⚠️ {selector} existe pero no está visible; se omite")
+            return False
+
+        opciones = self._opciones_combo(selector)
         if texto_busqueda:
             objetivo = texto_busqueda.strip().lower()
             for val, txt in opciones:
                 if objetivo in txt.lower() or objetivo == val.lower():
                     cmb.select_option(value=val)
                     self.page.wait_for_timeout(400)
-                    return
-        if fallback_primera_valida:
-            actual = cmb.input_value()
-            if actual in ("", "-1"):
-                for val, txt in opciones:
-                    if val not in ("", "-1") and txt:
-                        cmb.select_option(value=val)
-                        self.page.wait_for_timeout(400)
-                        return
+                    logger.info(f"✅ {selector} = {txt}")
+                    return True
+
+        actual = cmb.input_value()
+        if actual not in ("", "-1"):
+            return True
+
+        if estricto and len(opciones) != 1:
+            lista = " | ".join(t for _, t in opciones) or "(sin opciones)"
+            motivo = f"'{texto_busqueda}' no coincide con ninguna opción" if texto_busqueda else "no se indicó un valor"
+            raise RuntimeError(f"{selector}: {motivo}. Opciones de este producto: {lista}")
+
+        if fallback_primera_valida or estricto:
+            for val, txt in opciones:
+                cmb.select_option(value=val)
+                self.page.wait_for_timeout(400)
+                logger.warning(f"⚠️ {selector}: sin coincidencia para '{texto_busqueda}', se usó '{txt}'")
+                return True
+        return False
 
     def completar_datos_asistencia(
         self,
@@ -529,14 +660,26 @@ class PhoenixAutomation:
         lista_destino: str = "",
         tipo_viaje_sv: str = "",
     ):
-        """Paso 6 (Tab T0): Tipo de viaje, País de origen, Destino y Lista de destino."""
+        """
+        Paso 6 (Tab T0, 'Vehicle Details' en algunos productos): Type of trip, Destination y, si el
+        producto los tiene, País de origen y Lista de destino. Se adapta al formulario del producto:
+        solo completa los controles que existen y no adivina el destino cuando hay varias opciones.
+        """
         logger.info(f"Completando Tab T0: origen={pais_origen}, destino={destino}, lista={lista_destino}")
-        self.frame.locator("#Wcr_carTabPage_T0").click()
-        self.page.wait_for_timeout(500)
+        self._abrir_tab("Wcr_carTabPage_T0", "(datos de viaje)")
+
+        presentes = [
+            sel
+            for sel in ("#CMBTPVIAJESV", "#txtPaisOrigen", "#CMBDESTINOSV", "#txtListaDestinos")
+            if self.frame.locator(sel).count() > 0
+        ]
+        logger.info(f"Controles de viaje presentes en este producto: {presentes or 'ninguno'}")
+        if not presentes:
+            raise RuntimeError("La pestaña T0 no muestra controles de viaje (Destination / Type of trip) para este producto.")
 
         self._seleccionar_en_combo("#CMBTPVIAJESV", tipo_viaje_sv, fallback_primera_valida=True)
         self._seleccionar_en_combo("#txtPaisOrigen", pais_origen, fallback_primera_valida=False)
-        self._seleccionar_en_combo("#CMBDESTINOSV", destino, fallback_primera_valida=True)
+        self._seleccionar_en_combo("#CMBDESTINOSV", destino, estricto=True)
 
         texto_lista = lista_destino or destino
         if texto_lista:
